@@ -1,21 +1,10 @@
-# Python
+# Dataset
+/balanced_dataset.csv
+
+# Generated model artifacts
+/phishguard_artifacts/
+
+# Python environment
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-
-# Dataset
-*.csv
-
-# Model artifacts
-phishguard_artifacts/
-*.pth
-*.pt
-*.onnx
-
-# Jupyter
-.ipynb_checkpoints/
-
-# IDE
-.vscode/
-.idea/
