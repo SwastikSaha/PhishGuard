@@ -1,15 +1,21 @@
-.venv/
+# Python
 __pycache__/
 *.py[cod]
-.streamlit/secrets.toml
-logs/
-data/*.json
-data/processed/*.json
-ml/artifacts/best_params.json
-ml/artifacts/splits.json
-ml/artifacts/candidate/*
-ml/artifacts/current/*
-ml/artifacts/previous/*
-!ml/artifacts/candidate/.gitkeep
-!ml/artifacts/current/.gitkeep
-!ml/artifacts/previous/.gitkeep
+.venv/
+venv/
+
+# Dataset
+*.csv
+
+# Model artifacts
+phishguard_artifacts/
+*.pth
+*.pt
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
