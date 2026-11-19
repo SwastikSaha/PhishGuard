@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-PhishGuard dataset manager.
-
-Loads the URL CSV, validates/cleans it, creates domain-grouped
-train/validation/test splits, fits preprocessing on TRAIN only, and
-writes reusable NumPy/joblib artifacts.
-
-Usage:
-    python dataset_manager.py --csv /path/to/balanced_dataset.csv
-    python dataset_manager.py --csv ./balanced_dataset.csv --output ./artifacts
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -50,12 +37,10 @@ DOMAIN_COLUMN = "domain"
 
 
 def make_one_hot_encoder():
-    """Support both newer and older scikit-learn versions."""
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
-
 
 def build_preprocessor() -> ColumnTransformer:
     numeric_pipeline = Pipeline([
@@ -73,7 +58,7 @@ def build_preprocessor() -> ColumnTransformer:
 
 
 def grouped_split(X, y, groups, seed=42):
-    """Approximate 70/15/15 split while keeping each domain in one split."""
+
     first = GroupShuffleSplit(
         n_splits=1, test_size=0.15, random_state=seed
     )
