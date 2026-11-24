@@ -1,426 +1,308 @@
-"""
-Expected input artifacts (created by dataset_manager.py):
-    phishguard_artifacts/train.npz
-    phishguard_artifacts/validation.npz
-    phishguard_artifacts/test.npz
-    phishguard_artifacts/preprocessor.joblib
-Outputs:
-    phishguard_mlp.pth
-    training_history.csv
-    test_metrics.json
-    test_confusion_matrix.csv
-    model_config.json
-Run:
-    python mlp_model.py
-    python mlp_model.py --artifacts phishguard_artifacts --epochs 30
-"""
+#!/usr/bin/env python3
+"""Train and evaluate PhishGuard's URL classifier.
 
+The historical filename is retained for project compatibility. This version
+uses character n-gram TF-IDF + URL/hostname features + Logistic Regression.
+"""
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import random
+import math
+import re
+import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import joblib
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-
+from scipy.sparse import csr_matrix
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
+    accuracy_score, confusion_matrix, f1_score, precision_score,
+    recall_score, roc_auc_score, classification_report,
 )
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
-def get_device(requested: str = "auto") -> torch.device:
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    device = torch.device(requested)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested, but CUDA is not available.")
-    return device
-
-
-class URLClassifier(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_sizes: tuple[int, int] = (256, 128),
-        num_classes: int = 2,
-    ) -> None:
-        super().__init__()
-        if input_size <= 0:
-            raise ValueError("input_size must be positive.")
-        if len(hidden_sizes) != 2 or any(size <= 0 for size in hidden_sizes):
-            raise ValueError("hidden_sizes must contain two positive integers.")
-        if num_classes != 2:
-            raise ValueError("This implementation is configured for 2 classes.")
-        self.input_size = input_size
-        self.hidden_sizes = tuple(hidden_sizes)
-        self.num_classes = num_classes
-        self.network = nn.Sequential(
-            nn.Linear(input_size, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], num_classes),
-        )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
-
-def load_split(path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Missing dataset artifact: {path}\n"
-            "Run dataset_manager.py first."
-        )
-    with np.load(path) as data:
-        X = data["X"].astype(np.float32, copy=False)
-        y = data["y"].astype(np.int64, copy=False)
-    if X.ndim != 2:
-        raise ValueError(f"{path.name}: X must be a 2D matrix; got {X.shape}.")
-    if y.ndim != 1:
-        raise ValueError(f"{path.name}: y must be a 1D vector; got {y.shape}.")
-    if len(X) != len(y):
-        raise ValueError(f"{path.name}: X and y have different row counts.")
-    if not np.isfinite(X).all():
-        raise ValueError(f"{path.name}: X contains NaN or infinite values.")
-    if not np.isin(y, [0, 1]).all():
-        raise ValueError(f"{path.name}: labels must be 0 or 1.")
-    return torch.from_numpy(X), torch.from_numpy(y)
+def normalize_url(value: object) -> str:
+    """Tolerant, idempotent URL canonicalisation; never rejects a nonblank URL."""
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"nan", "none", "null"}:
+        return ""
+    candidate = raw if "://" in raw else "http://" + raw.lstrip("/")
+    try:
+        parsed = urlsplit(candidate)
+        host = parsed.hostname or ""
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+    except ValueError:
+        return raw
+    if not host:
+        return raw
+    host = host.rstrip(".").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    result = host + (f":{port}" if port is not None else "") + (parsed.path or "/")
+    if parsed.query:
+        result += "?" + parsed.query
+    if parsed.fragment:
+        result += "#" + parsed.fragment
+    return result
 
 
-def make_loader(
-    X: torch.Tensor,
-    y: torch.Tensor,
-    batch_size: int,
-    shuffle: bool,
-    device: torch.device,
-) -> DataLoader:
-    dataset = TensorDataset(X, y)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
+def _parse_for_features(value: object):
+    text = normalize_url(value)
+    candidate = text if "://" in text else "http://" + text
+    try:
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        parsed = urlsplit("")
+        host = ""
+    return text, parsed, host
+
+
+def _entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts = np.fromiter((text.count(ch) for ch in set(text)), dtype=float)
+    probabilities = counts / counts.sum()
+    return float(-(probabilities * np.log2(probabilities)).sum())
+
+
+class URLFeatureExtractor(BaseEstimator, TransformerMixin):
+    """Numerical features that complement, rather than replace, URL text."""
+    feature_names = [
+        "url_length", "host_length", "path_length", "query_length",
+        "host_dot_count", "host_hyphen_count", "host_digit_count",
+        "host_alpha_count", "subdomain_count", "path_depth",
+        "query_parameter_count", "at_symbol_count", "percent_count",
+        "equals_count", "ampersand_count", "underscore_count",
+        "hyphen_count", "digit_ratio", "special_char_ratio",
+        "host_entropy", "url_entropy", "is_ip_address", "has_punycode",
+        "tld_length", "suspicious_word_count", "longest_label",
+        "double_slash_in_path", "has_ip_like_text",
+    ]
+    suspicious_words = (
+        "login", "signin", "verify", "account", "update", "secure",
+        "bank", "wallet", "password", "confirm", "webscr", "paypal",
+        "support", "recover", "billing", "invoice", "auth",
     )
 
+    def fit(self, X, y=None):
+        return self
 
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
-    model.eval()
+    def transform(self, X):
+        rows = []
+        for value in X:
+            text, parsed, host = _parse_for_features(value)
+            path, query = parsed.path or "", parsed.query or ""
+            labels = [part for part in host.split(".") if part]
+            tld = labels[-1] if labels else ""
+            total = max(len(text), 1)
+            digits = sum(ch.isdigit() for ch in text)
+            special = sum(not ch.isalnum() for ch in text)
+            try:
+                import ipaddress
+                ipaddress.ip_address(host)
+                is_ip = 1.0
+            except ValueError:
+                is_ip = 0.0
+            lowered = text.lower()
+            suspicious = sum(lowered.count(word) for word in self.suspicious_words)
+            row = [
+                len(text), len(host), len(path), len(query),
+                host.count("."), host.count("-"), sum(c.isdigit() for c in host),
+                sum(c.isalpha() for c in host), max(len(labels) - 2, 0),
+                len([p for p in path.split("/") if p]),
+                query.count("&") + (1 if query else 0), text.count("@"),
+                text.count("%"), text.count("="), text.count("&"),
+                text.count("_"), text.count("-"), digits / total,
+                special / total, _entropy(host), _entropy(text), is_ip,
+                float("xn--" in host), len(tld), suspicious,
+                max((len(label) for label in labels), default=0),
+                float("//" in path), float(bool(re.search(r"\d{1,3}(?:\.\d{1,3}){3}", text))),
+            ]
+            rows.append(row)
+        return np.asarray(rows, dtype=np.float32)
 
-    total_loss = 0.0
-    labels_all = []
-    predictions_all = []
-    probabilities_all = []
 
-    with torch.inference_mode():
-        for features, labels in loader:
-            features = features.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+# Ensure joblib records a stable importable module path even when this file is
+# executed as a script (where Python would otherwise record __main__).
+if __name__ == "__main__":
+    sys.modules.setdefault("mlp_model", sys.modules[__name__])
+URLFeatureExtractor.__module__ = "mlp_model"
 
-            logits = model(features)
-            loss = criterion(logits, labels)
-            probabilities = torch.softmax(logits, dim=1)
-            predictions = logits.argmax(dim=1)
 
-            total_loss += loss.item() * labels.size(0)
-
-            labels_all.append(labels.cpu().numpy())
-            predictions_all.append(predictions.cpu().numpy())
-            probabilities_all.append(probabilities[:, 1].cpu().numpy())
-
-    y_true = np.concatenate(labels_all)
-    y_pred = np.concatenate(predictions_all)
-    y_phishing_probability = np.concatenate(probabilities_all)
-
-    metrics = {
-        "loss": float(total_loss / len(loader.dataset)),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "precision": float(precision_score(
-            y_true, y_pred, zero_division=0
+def build_model(max_features: int = 300000, min_df: int = 2, c_value: float = 2.0):
+    features = FeatureUnion(
+        transformer_list=[
+            ("char_tfidf", TfidfVectorizer(
+                analyzer="char", ngram_range=(3, 5), min_df=min_df,
+                max_features=max_features, sublinear_tf=True,
+                dtype=np.float32, lowercase=True,
+            )),
+            ("url_features", Pipeline([
+                ("extract", URLFeatureExtractor()),
+                ("scale", StandardScaler(with_mean=False)),
+            ])),
+        ],
+        n_jobs=None,
+    )
+    return Pipeline([
+        ("features", features),
+        ("classifier", LogisticRegression(
+            solver="liblinear", C=c_value, max_iter=1000,
+            class_weight="balanced", random_state=42,
         )),
-        "recall": float(recall_score(
-            y_true, y_pred, zero_division=0
-        )),
-        "f1": float(f1_score(
-            y_true, y_pred, zero_division=0
-        )),
-        "roc_auc": float(roc_auc_score(
-            y_true, y_phishing_probability
-        )),
+    ])
+
+
+def load_split(path: Path, name: str) -> tuple[np.ndarray, np.ndarray]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}. Run dataset_manager.py first.")
+    frame = pd.read_csv(path)
+    required = {"url", "label"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+    urls = [normalize_url(value) for value in frame["url"].fillna("").astype(str)]
+    labels = pd.to_numeric(frame["label"], errors="coerce")
+    if labels.isna().any():
+        raise ValueError(f"{path} contains missing or non-numeric labels.")
+    y = labels.astype(int).to_numpy()
+    if not set(np.unique(y)).issubset({0, 1}):
+        raise ValueError(f"{path} labels must be 0 (legitimate) or 1 (phishing).")
+    if any(not url for url in urls):
+        bad_count = sum(not url for url in urls)
+        raise ValueError(f"{path} contains {bad_count} blank URLs after normalisation.")
+    if len(np.unique(y)) != 2:
+        raise ValueError(f"{path} must contain both classes; found {np.unique(y).tolist()}.")
+    return np.asarray(urls, dtype=object), y
+
+
+def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray, max_fpr: float) -> float:
+    """Choose the lowest threshold whose empirical validation FPR <= max_fpr."""
+    if not 0.0 <= max_fpr < 1.0:
+        raise ValueError("--max-fpr must be in [0, 1).")
+    benign_scores = np.sort(probabilities[y_true == 0])
+    if len(benign_scores) == 0:
+        raise ValueError("Validation split has no legitimate examples.")
+    candidates = np.unique(np.concatenate(([0.0], benign_scores, [1.0])))
+    valid = []
+    for threshold in candidates:
+        fpr = float(np.mean(benign_scores >= threshold))
+        if fpr <= max_fpr:
+            valid.append(float(threshold))
+    if not valid:
+        return float(np.nextafter(1.0, 2.0))
+    return min(valid)
+
+
+def calculate_metrics(y_true, probabilities, threshold: float) -> dict:
+    predictions = (probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+    try:
+        auc = float(roc_auc_score(y_true, probabilities))
+    except ValueError:
+        auc = None
+    return {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy_score(y_true, predictions)),
+        "precision": float(precision_score(y_true, predictions, zero_division=0)),
+        "recall": float(recall_score(y_true, predictions, zero_division=0)),
+        "f1": float(f1_score(y_true, predictions, zero_division=0)),
+        "roc_auc": auc,
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "fpr": float(fp / (fp + tn)) if fp + tn else 0.0,
+        "fnr": float(fn / (fn + tp)) if fn + tp else 0.0,
     }
 
-    return metrics, y_true, y_pred, y_phishing_probability
 
-
-def train(args) -> None:
-    set_seed(args.seed)
-    device = get_device(args.device)
-
-    artifacts_dir = Path(args.artifacts).expanduser().resolve()
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Device: {device}")
-    print(f"Loading data from: {artifacts_dir}")
-
-    X_train, y_train = load_split(artifacts_dir / "train.npz")
-    X_val, y_val = load_split(artifacts_dir / "validation.npz")
-    X_test, y_test = load_split(artifacts_dir / "test.npz")
-
-    input_size = X_train.shape[1]
-
-    if X_val.shape[1] != input_size or X_test.shape[1] != input_size:
-        raise ValueError("Train/validation/test feature dimensions do not match.")
-
-    for split_name, labels in [
-        ("Train", y_train),
-        ("Validation", y_val),
-        ("Test", y_test),
-    ]:
-        counts = torch.bincount(labels, minlength=2).tolist()
-        print(
-            f"{split_name:12s}: {len(labels):,} samples | "
-            f"legitimate={counts[0]:,}, phishing={counts[1]:,}"
-        )
-
-    train_loader = make_loader(
-        X_train, y_train, args.batch_size, True, device
-    )
-    val_loader = make_loader(
-        X_val, y_val, args.batch_size, False, device
-    )
-    test_loader = make_loader(
-        X_test, y_test, args.batch_size, False, device
-    )
-
-    model = URLClassifier(
-        input_size=input_size,
-        hidden_sizes=(args.hidden1, args.hidden2),
-        num_classes=2,
-    ).to(device)
-
-    parameter_count = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
-
-    print("\nModel:")
-    print(model)
-    print(f"Trainable parameters: {parameter_count:,}")
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-    )
-
-    best_val_loss = float("inf")
-    best_epoch = 0
-    best_state = None
-    patience_counter = 0
-    history = []
-
-    print("\n========== TRAINING ==========")
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
-
-        for features, labels in train_loader:
-            features = features.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            logits = model(features)
-            loss = criterion(logits, labels)
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * labels.size(0)
-
-        train_loss = running_loss / len(train_loader.dataset)
-
-        val_metrics, _, _, _ = evaluate(
-            model, val_loader, criterion, device
-        )
-
-        scheduler.step()
-
-        row = {
-            "epoch": epoch,
-            "train_loss": float(train_loss),
-            "val_loss": val_metrics["loss"],
-            "val_accuracy": val_metrics["accuracy"],
-            "val_precision": val_metrics["precision"],
-            "val_recall": val_metrics["recall"],
-            "val_f1": val_metrics["f1"],
-            "val_auc": val_metrics["roc_auc"],
-            "learning_rate": float(optimizer.param_groups[0]["lr"]),
-        }
-        history.append(row)
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
-            patience_counter = 0
-
-            torch.save(
-                best_state,
-                artifacts_dir / "phishguard_mlp.pth",
-            )
-            status = "Best model saved"
-        else:
-            patience_counter += 1
-            status = f"No improvement ({patience_counter}/{args.patience})"
-
-        print(
-            f"Epoch {epoch:02d}/{args.epochs} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_metrics['loss']:.4f} | "
-            f"Val Acc: {val_metrics['accuracy']:.4f} | "
-            f"Val F1: {val_metrics['f1']:.4f} | "
-            f"Val AUC: {val_metrics['roc_auc']:.4f} | "
-            f"{status}"
-        )
-
-        if patience_counter >= args.patience:
-            print("\nEarly stopping triggered.")
-            break
-
-    if best_state is None:
-        raise RuntimeError("Training failed to produce a best checkpoint.")
-
-    pd.DataFrame(history).to_csv(
-        artifacts_dir / "training_history.csv",
-        index=False,
-    )
-
-    model.load_state_dict(best_state)
-    model.eval()
-
-    print(f"\nBest checkpoint: epoch {best_epoch}")
-    print(f"Best validation loss: {best_val_loss:.6f}")
-
-    test_metrics, y_true, y_pred, y_prob = evaluate(
-        model, test_loader, criterion, device
-    )
-
-    test_metrics["best_epoch"] = int(best_epoch)
-    test_metrics["test_samples"] = int(len(y_true))
-    test_metrics["trainable_parameters"] = int(parameter_count)
-
-    with open(artifacts_dir / "test_metrics.json", "w", encoding="utf-8") as f:
-        json.dump(test_metrics, f, indent=2)
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    pd.DataFrame(
-        cm,
-        index=["actual_legitimate", "actual_phishing"],
-        columns=["predicted_legitimate", "predicted_phishing"],
-    ).to_csv(artifacts_dir / "test_confusion_matrix.csv")
-
-    print("\n========== FINAL TEST RESULTS ==========")
-    for name, value in test_metrics.items():
-        if isinstance(value, float):
-            print(f"{name:24s}: {value:.4f}")
-        else:
-            print(f"{name:24s}: {value}")
-
-    print("\nClassification report:")
-    print(classification_report(
-        y_true,
-        y_pred,
-        labels=[0, 1],
-        target_names=["Legitimate", "Phishing"],
-        digits=4,
-        zero_division=0,
-    ))
-
-    print("Confusion matrix:")
-    print(cm)
-
-    config = {
-        "input_size": int(input_size),
-        "hidden_sizes": [int(args.hidden1), int(args.hidden2)],
-        "num_classes": 2,
-        "class_mapping": {
-            "0": "Legitimate",
-            "1": "Phishing",
-        },
-        "best_epoch": int(best_epoch),
-        "trainable_parameters": int(parameter_count),
-        "batch_size": int(args.batch_size),
-        "seed": int(args.seed),
-    }
-    with open(artifacts_dir / "model_config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-    print(f"\nAll model outputs saved in: {artifacts_dir}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train and evaluate"
-    )
-    parser.add_argument("--artifacts", default="phishguard_artifacts")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--hidden1", type=int, default=256)
-    parser.add_argument("--hidden2", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="auto",
-                        help="auto, cpu, cuda, or another torch device.")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Train the PhishGuard URL model.")
+    parser.add_argument("--artifacts", type=Path, default=Path("phishguard_artifacts"))
+    parser.add_argument("--max-fpr", type=float, default=0.02)
+    parser.add_argument("--max-features", type=int, default=300000)
+    parser.add_argument("--min-df", type=int, default=2)
+    parser.add_argument("--c", type=float, default=2.0)
     args = parser.parse_args()
 
-    if args.epochs < 1 or args.patience < 1 or args.batch_size < 1:
-        parser.error("epochs, patience and batch-size must be positive.")
-    if args.hidden1 < 1 or args.hidden2 < 1:
-        parser.error("Hidden layer sizes must be positive.")
-    if args.learning_rate <= 0 or args.weight_decay < 0:
-        parser.error("Invalid learning rate or weight decay.")
+    print("[1/5] Loading domain-separated data...")
+    X_train, y_train = load_split(args.artifacts / "train.csv", "train")
+    X_val, y_val = load_split(args.artifacts / "validation.csv", "validation")
+    X_test, y_test = load_split(args.artifacts / "test.csv", "test")
+    print(f"      Train={len(y_train):,}, validation={len(y_val):,}, test={len(y_test):,}")
 
-    return args
+    print("[2/5] Building model...")
+    model = build_model(args.max_features, args.min_df, args.c)
+    print("[3/5] Training...")
+    model.fit(X_train, y_train)
+
+    print("[4/5] Calibrating threshold on validation data...")
+    val_prob = model.predict_proba(X_val)[:, 1]
+    threshold = choose_threshold(y_val, val_prob, args.max_fpr)
+    val_metrics = calculate_metrics(y_val, val_prob, threshold)
+
+    print("[5/5] Evaluating once on held-out test data...")
+    test_prob = model.predict_proba(X_test)[:, 1]
+    test_metrics = calculate_metrics(y_test, test_prob, threshold)
+
+    args.artifacts.mkdir(parents=True, exist_ok=True)
+    model_path = args.artifacts / "phishguard_model.joblib"
+    joblib.dump({"model": model, "threshold": threshold, "label_order": [0, 1]}, model_path)
+
+    report = {
+        "model": "character TF-IDF + URL features + LogisticRegression",
+        "label_mapping": {"0": "legitimate", "1": "phishing"},
+        "threshold_selection": f"validation FPR <= {args.max_fpr}",
+        "max_validation_fpr_target": args.max_fpr,
+        "validation": val_metrics,
+        "test": test_metrics,
+        "classification_report_test": classification_report(
+            y_test, (test_prob >= threshold).astype(int),
+            labels=[0, 1], target_names=["legitimate", "phishing"],
+            output_dict=True, zero_division=0,
+        ),
+        "notes": [
+            "The FPR constraint is calibrated on validation data, not guaranteed on future traffic.",
+            "The test set is evaluated once after threshold selection.",
+            "The Tranco list is popularity-based, not a safety guarantee.",
+        ],
+    }
+    (args.artifacts / "model_metrics.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    pd.DataFrame([
+        {"split": "validation", **val_metrics},
+        {"split": "test", **test_metrics},
+    ]).to_csv(args.artifacts / "model_metrics.csv", index=False)
+
+    print(f"      Selected threshold: {threshold:.6f}")
+    print(f"      Validation FPR: {val_metrics['fpr']:.4%}")
+    print(f"      Test accuracy: {test_metrics['accuracy']:.4f}")
+    print(f"      Test precision: {test_metrics['precision']:.4f}")
+    print(f"      Test recall: {test_metrics['recall']:.4f}")
+    print(f"      Test F1: {test_metrics['f1']:.4f}")
+    print(f"      Test ROC-AUC: {test_metrics['roc_auc']}")
+    print(f"      Model saved: {model_path.resolve()}")
+    return 0
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise

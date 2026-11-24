@@ -1,214 +1,163 @@
+#!/usr/bin/env python3
+"""Classify URLs with PhishGuard and optionally explain the result with Qwen.
 
+The ML classifier is authoritative. The LLM receives the classifier result and
+transparent URL observations; it is not allowed to alter the verdict.
+"""
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
-import math
-import re
 import sys
-from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import joblib
-import numpy as np
-import pandas as pd
-import torch
 
-from mlp_model import URLClassifier
-
+from mlp_model import URLFeatureExtractor, normalize_url
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
-NUMERIC_FEATURES = [
-    "url_length", "url_entropy", "slash_count", "query_length",
-    "domain_length", "domain_entropy", "sub_domain", "digit_count",
-    "special_char_count", "hyphen_count", "https_flag", "ip_flag",
-    "at_flag", "keyword_flag",
-]
 
-SUSPICIOUS_KEYWORDS = {
-    "login", "signin", "verify", "verification", "update", "secure",
-    "account", "banking", "password", "confirm", "wallet", "invoice",
-    "payment", "recover", "suspend", "unlock", "authenticate",
-}
-
-# These are transparent heuristic observations, NOT feature attributions.
-KEYWORD_PATTERN = re.compile(
-    r"(?<![a-z])(" + "|".join(map(re.escape, sorted(SUSPICIOUS_KEYWORDS))) +
-    r")(?![a-z])",
-    re.IGNORECASE,
-)
-
-
-def shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    counts = Counter(value)
-    length = len(value)
-    return -sum((count / length) * math.log2(count / length)
-                for count in counts.values())
-
-
-def parse_url(raw_url: str):
-    raw_url = raw_url.strip()
-    candidate = raw_url if "://" in raw_url else "http://" + raw_url
-    parsed = urlsplit(candidate)
-
-    # Reject malformed inputs early. Accessing .port can raise ValueError.
+def get_host(url: str) -> str:
+    candidate = url if "://" in url else "http://" + url
     try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"Invalid URL port: {exc}") from exc
-
-    host = (parsed.hostname or "").lower().strip(".")
-    if not host:
-        raise ValueError("Could not extract a hostname. Supply a URL such as https://example.com")
-    return raw_url, parsed, host
-
-
-def extract_features(raw_url: str) -> dict:
-    original, parsed, host = parse_url(raw_url)
-
-    try:
-        ipaddress.ip_address(host)
-        is_ip = 1
+        return (urlsplit(candidate).hostname or "").lower().rstrip(".")
     except ValueError:
-        is_ip = 0
+        return ""
 
-    labels = [part for part in host.split(".") if part]
-    tld = labels[-1] if labels else "unknown"
-    subdomain_count = max(0, len(labels) - 2) if not is_ip else 0
 
-    lowered_url = original.lower()
-    keyword_flag = int(KEYWORD_PATTERN.search(lowered_url) is not None)
-
+def load_allowlist(path: Path) -> set[str]:
+    if not path.is_file():
+        return set()
     return {
-        "url_length": len(original),
-        "url_entropy": shannon_entropy(original),
-        "slash_count": original.count("/"),
-        "query_length": len(parsed.query),
-        "domain_length": len(host),
-        "domain_entropy": shannon_entropy(host),
-        "sub_domain": subdomain_count,
-        "digit_count": sum(ch.isdigit() for ch in original),
-        "special_char_count": sum(not ch.isalnum() for ch in original),
-        "hyphen_count": original.count("-"),
-        "https_flag": int(parsed.scheme.lower() == "https"),
-        "ip_flag": is_ip,
-        "at_flag": int("@" in original),
-        "keyword_flag": keyword_flag,
-        "tld": tld,
+        line.strip().lower().removeprefix("www.").rstrip(".")
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
     }
 
 
-def analyse_observations(raw_url: str, features: dict) -> dict:
+def allowlist_match(host: str, allowlist: set[str]) -> bool:
+    """Tranco popularity-list match; never use this as a verdict override."""
+    return bool(host) and any(
+        host == domain or host.endswith("." + domain) for domain in allowlist
+    )
+
+
+def collect_observations(url: str, host: str, features: dict, listed: bool) -> dict:
     observations = []
     reassuring = []
 
-    if features["ip_flag"]:
+    if features["is_ip_address"]:
         observations.append("The hostname is an IP address rather than a conventional domain name.")
-    if features["at_flag"]:
-        observations.append("The URL contains an '@' character, which can obscure the intended destination in some URL formats.")
-    if features["keyword_flag"]:
-        matches = sorted(set(m.group(0).lower() for m in KEYWORD_PATTERN.finditer(raw_url)))
-        observations.append("The URL contains potentially sensitive terms: " + ", ".join(matches) + ".")
-    if features["sub_domain"] >= 3:
-        observations.append(f"The hostname has {features['sub_domain']} subdomain labels under the provisional parser.")
-    if features["hyphen_count"] >= 3:
-        observations.append(f"The URL contains {features['hyphen_count']} hyphens.")
+    if "@" in url:
+        observations.append("The URL contains '@', which can make the apparent destination confusing.")
+    if features["suspicious_word_count"]:
+        observations.append(
+            f"The URL contains {features['suspicious_word_count']} occurrence(s) of configured "
+            "security-sensitive terms such as login, verify, account, or password."
+        )
+    if features["host_hyphen_count"] >= 3:
+        observations.append(f"The hostname contains {features['host_hyphen_count']} hyphens.")
+    if features["subdomain_count"] >= 3:
+        observations.append(f"The hostname has {features['subdomain_count']} subdomain labels.")
     if features["url_length"] >= 100:
-        observations.append(f"The URL is relatively long ({features['url_length']} characters).")
-    if features["query_length"] >= 50:
-        observations.append(f"The query string is relatively long ({features['query_length']} characters).")
-    if features["https_flag"]:
-        reassuring.append("The URL uses HTTPS. This encrypts the connection but does not prove the site is legitimate.")
-    else:
-        observations.append("The URL does not use HTTPS.")
+        observations.append(f"The URL is long ({features['url_length']} characters).")
+    if features["query_parameter_count"] >= 5:
+        observations.append(
+            f"The URL contains {features['query_parameter_count']} query parameters."
+        )
+    if features["has_punycode"]:
+        observations.append("The hostname contains an IDN/Punycode label.")
+    if features["double_slash_in_path"]:
+        observations.append("The path contains a double-slash sequence.")
 
+    # A popularity-list hit is contextual only, not proof of legitimacy.
+    if listed:
+        reassuring.append(
+            "The hostname appears in the locally stored Tranco popularity list; "
+            "that list is not a security allowlist."
+        )
+    else:
+        reassuring.append(
+            "The hostname was not found in the local Tranco list; absence is not evidence of phishing."
+        )
+    if "https://" in url.lower():
+        reassuring.append(
+            "The URL uses HTTPS, which protects the connection in transit but does not prove the site is legitimate."
+        )
     if not observations:
-        observations.append("No indicators from the small set of configured URL heuristics were triggered.")
-    if not reassuring:
-        reassuring.append("No positive trust or reputation checks were performed.")
+        observations.append("None of the configured high-level URL heuristics were triggered.")
 
     return {
         "observed_indicators": observations,
-        "reassuring_observations": reassuring,
+        "contextual_observations": reassuring,
         "limitations": [
             "These are URL-string observations, not proof of malicious activity.",
-            "No DNS, certificate, redirect-chain, page-content, domain-age, or reputation lookup was performed.",
-            "Feature extraction is provisional because the original dataset-generation code is unavailable.",
+            "No DNS, TLS-certificate, redirect-chain, page-content, domain-age, or live reputation lookup was performed.",
+            "The ML probability is a model score, not a calibrated guarantee of real-world risk.",
+            "The explanation model does not have access to hidden classifier internals or true feature attributions.",
         ],
     }
 
 
-def load_classifier(artifact_dir: Path, model_path: Path, requested_device: str):
-    preprocessor_path = artifact_dir / "preprocessor.joblib"
-    config_path = artifact_dir / "model_config.json"
+def classify(url: str, bundle: dict, allowlist: set[str]) -> dict:
+    normalized = normalize_url(url)
+    if not normalized:
+        raise ValueError("Please provide a non-empty URL.")
 
-    if not preprocessor_path.is_file():
-        raise FileNotFoundError(f"Preprocessor not found: {preprocessor_path}")
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Model weights not found: {model_path}")
+    model = bundle["model"]
+    threshold = float(bundle.get("threshold", 0.5))
+    phishing_probability = float(model.predict_proba([normalized])[0, 1])
+    legitimate_probability = 1.0 - phishing_probability
+    verdict = "PHISHING" if phishing_probability >= threshold else "LEGITIMATE"
 
-    preprocessor = joblib.load(preprocessor_path)
-    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    host = get_host(normalized)
+    listed = allowlist_match(host, allowlist)
 
-    device = torch.device(
-        "cuda" if requested_device == "auto" and torch.cuda.is_available()
-        else "cpu" if requested_device == "auto"
-        else requested_device
-    )
-    hidden_sizes = tuple(config.get("hidden_sizes", [256, 128]))
+    # These are the same numeric URL features used by the current model pipeline.
+    feature_values = URLFeatureExtractor().transform([normalized])[0]
+    feature_names = URLFeatureExtractor.feature_names
+    features = {name: float(value) for name, value in zip(feature_names, feature_values)}
+    features["is_ip_address"] = bool(features["is_ip_address"])
+    features["has_punycode"] = bool(features["has_punycode"])
+    features["double_slash_in_path"] = bool(features["double_slash_in_path"])
+    evidence = collect_observations(normalized, host, features, listed)
 
-    return preprocessor, config, device, hidden_sizes
-
-
-def predict_url(url: str, preprocessor, config: dict, device,
-                hidden_sizes: tuple[int, int], model_path: Path):
-    features = extract_features(url)
-    feature_frame = pd.DataFrame([features])
-
-    transformed = preprocessor.transform(feature_frame).astype(np.float32)
-    expected_size = config.get("input_size")
-    if expected_size is not None and transformed.shape[1] != int(expected_size):
-        raise ValueError(
-            f"Preprocessor produced {transformed.shape[1]} features, "
-            f"but model_config.json expects {expected_size}."
-        )
-
-    model = URLClassifier(
-        input_size=transformed.shape[1],
-        hidden_sizes=hidden_sizes,
-        num_classes=2,
-    ).to(device)
-
-    state = torch.load(model_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
-
-    tensor = torch.from_numpy(transformed).to(device)
-    with torch.inference_mode():
-        logits = model(tensor)
-        probabilities = torch.softmax(logits, dim=1)[0]
-
-    return features, float(probabilities[0]), float(probabilities[1])
+    return {
+        "input_url": url,
+        "normalized_url": normalized,
+        "host": host,
+        "verdict": verdict,
+        "legitimate_probability": legitimate_probability,
+        "phishing_probability": phishing_probability,
+        "threshold": threshold,
+        "tranco_listed": listed,
+        "features": features,
+        **evidence,
+    }
 
 
-def generate_qwen_explanation(payload: dict, model_id: str,
-                              max_new_tokens: int, llm_device: str) -> str:
+def generate_qwen_explanation(
+    payload: dict,
+    model_id: str = MODEL_ID,
+    max_new_tokens: int = 180,
+    llm_device: str = "auto",
+) -> str:
+    """Generate an explanation from local Hugging Face Transformers weights."""
     try:
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
-            "Transformers is not installed. Run: "
-            "python -m pip install transformers accelerate"
+            "Qwen explanation dependencies are missing. Install with: "
+            "python -m pip install torch transformers accelerate"
         ) from exc
 
-    device = "cuda" if llm_device == "auto" and torch.cuda.is_available() else (
-        "cpu" if llm_device == "auto" else llm_device
-    )
+    if llm_device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = llm_device
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
 
     print(f"\nLoading explanation model: {model_id} ({device}) ...", flush=True)
@@ -216,25 +165,27 @@ def generate_qwen_explanation(payload: dict, model_id: str,
     llm = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     ).to(device)
     llm.eval()
 
     system_prompt = (
         "You are PhishGuard's security explanation component. "
-        "The supplied classifier verdict and probabilities are authoritative and must never be changed. "
-        "Explain only the supplied observations. Do not claim that a URL is confirmed malicious or safe. "
-        "Do not invent domain reputation, ownership, DNS records, certificate status, redirects, page contents, "
-        "or model feature attributions. Explicitly distinguish URL observations from the classifier's prediction. "
-        "HTTPS is not proof of legitimacy. If evidence is limited, say so. "
-        "Give a concise explanation understandable to a non-expert, followed by practical precautions."
+        "The supplied ML classifier verdict, probability, and threshold are authoritative. "
+        "Never change, reinterpret, or override the verdict. "
+        "Explain only the supplied URL observations and model output. "
+        "Do not invent domain reputation, ownership, DNS records, certificate status, "
+        "redirects, page contents, or model feature attributions. "
+        "HTTPS is not proof of legitimacy, and Tranco popularity is not proof of safety. "
+        "Clearly distinguish observed URL characteristics from the classifier's prediction. "
+        "If evidence is limited, say so. Give a concise explanation and practical precautions."
     )
-
     user_prompt = (
-        "Explain this PhishGuard analysis. The probabilities come from an experimental URL classifier. "
-        "Feature extraction may differ from the original training feature-generation process.\n\n"
+        "Explain this PhishGuard result for a non-expert. State the classifier verdict "
+        "without changing it, explain the strongest supplied indicators, mention uncertainty, "
+        "and give practical next steps.\n\n"
         + json.dumps(payload, indent=2, ensure_ascii=False)
     )
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -248,59 +199,56 @@ def generate_qwen_explanation(payload: dict, model_id: str,
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
 
-    with torch.inference_mode():
-        output = llm.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            repetition_penalty=1.05,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    try:
+        with torch.inference_mode():
+            output = llm.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                repetition_penalty=1.05,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        new_tokens = output[0][encoded["input_ids"].shape[-1]:]
+        explanation = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    finally:
+        del llm
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
-    new_tokens = output[0][encoded["input_ids"].shape[-1]:]
-    explanation = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    # Release model memory after one explanation.
-    del llm
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-
-    return explanation
+    return explanation or "The explanation model returned an empty response."
 
 
-def display_report(url: str, prediction: str, legitimate_probability: float,
-                   phishing_probability: float, threshold: float,
-                   features: dict, evidence: dict, explanation: str | None):
-    print("\n" + "=" * 62)
-    print("                    PHISHGUARD REPORT")
-    print("=" * 62)
-    print(f"URL:                    {url}")
-    print(f"Verdict:                {prediction}")
-    print(f"Legitimate probability: {legitimate_probability:.2%}")
-    print(f"Phishing probability:   {phishing_probability:.2%}")
-    print(f"Decision threshold:     {threshold:.2%}")
+def print_report(result: dict, explanation: str | None = None) -> None:
+    print("\n" + "=" * 66)
+    print("                         PHISHGUARD REPORT")
+    print("=" * 66)
+    print(f"URL:                    {result['input_url']}")
+    print(f"Verdict:                {result['verdict']}")
+    print(f"Legitimate probability: {result['legitimate_probability']:.2%}")
+    print(f"Phishing probability:   {result['phishing_probability']:.2%}")
+    print(f"Decision threshold:     {result['threshold']:.2%}")
+    print(f"Hostname:               {result['host'] or '(unparsed)'}")
 
-    print("\n--- URL FEATURE OBSERVATIONS ---")
-    for item in evidence["observed_indicators"]:
+    print("\n--- URL OBSERVATIONS ---")
+    for item in result["observed_indicators"]:
         print(f"[!] {item}")
-    for item in evidence["reassuring_observations"]:
-        print(f"[+] {item}")
+    for item in result["contextual_observations"]:
+        print(f"[i] {item}")
 
-    print("\n--- EXTRACTED FEATURES (PROVISIONAL) ---")
-    for name in NUMERIC_FEATURES:
-        print(f"{name:22s}: {features[name]}")
-    print(f"{'tld':22s}: {features['tld']}")
+    print("\n--- EXTRACTED MODEL FEATURES ---")
+    for name, value in result["features"].items():
+        print(f"{name:26s}: {value}")
 
     if explanation:
-        print("\n--- QWEN EXPLANATION ---")
+        print("\n--- QWEN LLM EXPLANATION ---")
         print(explanation)
 
     print("\n--- LIMITATIONS ---")
-    for item in evidence["limitations"]:
+    for item in result["limitations"]:
         print(f"- {item}")
-    print("\nThe LLM explains the classifier output; it does not determine the verdict.")
+    print("\nThe LLM explains the ML classifier output; it does not determine the verdict.")
     print("A model prediction is not a guarantee of website safety.")
-    print("=" * 62)
+    print("=" * 66)
 
 
 def parse_args():
@@ -308,21 +256,19 @@ def parse_args():
         description="Classify a URL with PhishGuard and optionally explain it with Qwen."
     )
     parser.add_argument("url", nargs="?", help="URL to classify.")
-    parser.add_argument("--artifacts", default="phishguard_artifacts")
-    parser.add_argument("--model", default="phishguard_artifacts/phishguard_mlp.pth")
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--device", default="auto", help="MLP device: auto or cpu (or supported torch device).")
-    parser.add_argument("--no-explanation", action="store_true", help="Skip Qwen and print classifier/evidence only.")
-    parser.add_argument("--llm", default=MODEL_ID, help="Hugging Face model ID for explanation.")
-    parser.add_argument("--llm-device", default="auto", help="Qwen device: auto or cpu (or supported torch device).")
+    parser.add_argument("--artifacts", type=Path, default=Path("phishguard_artifacts"))
+    parser.add_argument("--model", type=Path, default=None)
+    parser.add_argument("--allowlist", type=Path, default=None)
+    parser.add_argument("--no-explanation", action="store_true", help="Skip Qwen and run ML only.")
+    parser.add_argument("--llm", default=MODEL_ID, help="Hugging Face model ID for Qwen.")
+    parser.add_argument("--llm-device", default="auto", help="Qwen device: auto or cpu/cuda.")
     parser.add_argument("--max-new-tokens", type=int, default=180)
+    parser.add_argument("--json", action="store_true", help="Print result as JSON (no LLM explanation).")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if not 0.0 < args.threshold < 1.0:
-        raise ValueError("--threshold must be between 0 and 1.")
     if args.max_new_tokens < 1:
         raise ValueError("--max-new-tokens must be positive.")
 
@@ -330,48 +276,42 @@ def main():
     if not url:
         raise ValueError("No URL supplied.")
 
-    artifact_dir = Path(args.artifacts).expanduser().resolve()
-    model_path = Path(args.model).expanduser()
-    if not model_path.is_absolute():
-        model_path = Path.cwd() / model_path
+    model_path = args.model or (args.artifacts / "phishguard_model.joblib")
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            f"Model not found: {model_path}. Train it first with mlp_model.py."
+        )
+    bundle = joblib.load(model_path)
+    if not isinstance(bundle, dict) or "model" not in bundle:
+        raise RuntimeError(
+            "Incompatible model file. Retrain using the current mlp_model.py."
+        )
+    allowlist_path = args.allowlist or (args.artifacts / "tranco_allowlist.txt")
+    result = classify(url, bundle, load_allowlist(allowlist_path))
 
-    preprocessor, config, device, hidden_sizes = load_classifier(
-        artifact_dir, model_path, args.device
-    )
-
-    features, legitimate_probability, phishing_probability = predict_url(
-        url, preprocessor, config, device, hidden_sizes, model_path
-    )
-    prediction = "PHISHING" if phishing_probability >= args.threshold else "LEGITIMATE"
-    evidence = analyse_observations(url, features)
-
-    payload = {
-        "url": url,
-        "verdict": prediction,
-        "legitimate_probability": round(legitimate_probability, 6),
-        "phishing_probability": round(phishing_probability, 6),
-        "threshold": args.threshold,
-        "features": features,
-        "observed_indicators": evidence["observed_indicators"],
-        "reassuring_observations": evidence["reassuring_observations"],
-        "limitations": evidence["limitations"],
-    }
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
 
     explanation = None
     if not args.no_explanation:
         try:
             explanation = generate_qwen_explanation(
-                payload, args.llm, args.max_new_tokens, args.llm_device
+                result, args.llm, args.max_new_tokens, args.llm_device
             )
         except Exception as exc:
             print(f"\n[!] Qwen explanation unavailable: {exc}", file=sys.stderr)
-            print("[!] Continuing with the MLP verdict and deterministic observations.", file=sys.stderr)
+            print(
+                "[!] Continuing with the ML verdict and deterministic observations.",
+                file=sys.stderr,
+            )
 
-    display_report(
-        url, prediction, legitimate_probability, phishing_probability,
-        args.threshold, features, evidence, explanation
-    )
+    print_report(result, explanation)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2)

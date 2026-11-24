@@ -1,224 +1,292 @@
+#!/usr/bin/env python3
+"""Build a domain-separated URL dataset for PhishGuard.
+
+Labels: 1 = phishing, 0 = legitimate.
+The script uses the active Phishing.Database feed and the Tranco top-sites list.
+"""
 from __future__ import annotations
 
 import argparse
+import csv
+import io
+import ipaddress
 import json
+import random
+import re
+import sys
+import urllib.request
+import zipfile
+from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
-import joblib
-import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+PHISHING_FEED = (
+    "https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/"
+    "master/phishing-links-ACTIVE.txt"
+)
+TRANCO_ZIP = "https://tranco-list.eu/top-1m.csv.zip"
+USER_AGENT = "PhishGuard-DatasetBuilder/2.0"
 
 
-NUMERIC_FEATURES = [
-    "url_length",
-    "url_entropy",
-    "slash_count",
-    "query_length",
-    "domain_length",
-    "domain_entropy",
-    "sub_domain",
-    "digit_count",
-    "special_char_count",
-    "hyphen_count",
-    "https_flag",
-    "ip_flag",
-    "at_flag",
-    "keyword_flag",
-]
-CATEGORICAL_FEATURES = ["tld"]
-TARGET = "label"
-URL_COLUMN = "url"
-DOMAIN_COLUMN = "domain"
+def download_bytes(url: str, timeout: int = 60) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
 
 
-def make_one_hot_encoder():
+def normalize_url(value: object) -> str:
+    """Canonicalise scheme/www without rejecting unusual but usable URLs.
+
+    Hostnames are lowercased; path/query case is preserved because URL paths
+    can be case-sensitive. Invalid parser edge cases fall back to the raw text.
+    """
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"nan", "none", "null"}:
+        return ""
+    candidate = raw if "://" in raw else "http://" + raw.lstrip("/")
     try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
-
-def build_preprocessor() -> ColumnTransformer:
-    numeric_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    categorical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", make_one_hot_encoder()),
-    ])
-    return ColumnTransformer([
-        ("numeric", numeric_pipeline, NUMERIC_FEATURES),
-        ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),
-    ])
-
-
-def grouped_split(X, y, groups, seed=42):
-
-    first = GroupShuffleSplit(
-        n_splits=1, test_size=0.15, random_state=seed
-    )
-    train_val_idx, test_idx = next(first.split(X, y, groups))
-
-    second = GroupShuffleSplit(
-        n_splits=1, test_size=(0.15 / 0.85), random_state=seed
-    )
-    train_rel, val_rel = next(
-        second.split(
-            X.iloc[train_val_idx],
-            y.iloc[train_val_idx],
-            groups.iloc[train_val_idx],
-        )
-    )
-    train_idx = train_val_idx[train_rel]
-    val_idx = train_val_idx[val_rel]
-    return train_idx, val_idx, test_idx
+        parsed = urlsplit(candidate)
+        host = parsed.hostname or ""
+        # Accessing .port can raise ValueError on malformed ports.
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+    except ValueError:
+        return raw
+    if not host:
+        return raw
+    host = host.rstrip(".").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    netloc = host + (f":{port}" if port is not None else "")
+    path = parsed.path or "/"
+    result = netloc + path
+    if parsed.query:
+        result += "?" + parsed.query
+    if parsed.fragment:
+        result += "#" + parsed.fragment
+    return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare PhishGuard URL dataset.")
-    parser.add_argument("--csv", required=True, help="Path to the source CSV.")
-    parser.add_argument("--output", default="phishguard_artifacts",
-                        help="Directory for processed splits and preprocessing.")
+def extract_host(url: str) -> str:
+    if not url:
+        return ""
+    candidate = url if "://" in url else "http://" + url
+    try:
+        return (urlsplit(candidate).hostname or "").rstrip(".").lower()
+    except ValueError:
+        # Best-effort fallback for malformed bracket/authority edge cases.
+        authority = candidate.split("/", 3)[2] if candidate.count("/") >= 2 else ""
+        authority = authority.rsplit("@", 1)[-1].split(":", 1)[0]
+        return authority.strip("[]").rstrip(".").lower()
+
+
+_MULTI_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "co.in", "firm.in", "net.in", "org.in", "gen.in", "ind.in",
+    "co.jp", "ne.jp", "or.jp", "com.br", "com.cn", "com.sg", "co.nz",
+}
+
+
+def registrable_domain(host: str) -> str:
+    """Return a practical registrable-domain grouping key.
+
+    Uses tldextract when installed (with network updates disabled); otherwise
+    uses a conservative common-multi-suffix fallback.
+    """
+    host = (host or "").strip(".").lower()
+    if not host:
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    try:
+        import tldextract  # optional, recommended
+        extracted = tldextract.TLDExtract(suffix_list_urls=())(host)
+        if extracted.domain and extracted.suffix:
+            return f"{extracted.domain}.{extracted.suffix}"
+    except Exception:
+        pass
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    last_two = ".".join(labels[-2:])
+    if last_two in _MULTI_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last_two
+
+
+def parse_phishing_feed(content: bytes, limit: int) -> list[dict]:
+    text = content.decode("utf-8", errors="replace")
+    rows, seen = [], set()
+    for line in text.splitlines():
+        item = line.strip().strip('"').strip("'")
+        if not item or item.startswith(("#", ";")):
+            continue
+        # Ignore obvious feed metadata/header rows.
+        if item.lower() in {"url", "phishing_url", "domain"}:
+            continue
+        normalized = normalize_url(item)
+        host = extract_host(normalized)
+        if not normalized or not host:
+            continue
+        domain = registrable_domain(host)
+        if not domain or normalized in seen:
+            continue
+        seen.add(normalized)
+        rows.append({"url": normalized, "label": 1, "domain": domain})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def parse_tranco_zip(content: bytes, limit: int) -> list[dict]:
+    rows, seen = [], set()
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+        if not csv_names:
+            raise RuntimeError("Tranco archive did not contain a CSV file.")
+        with archive.open(csv_names[0]) as stream:
+            reader = csv.reader(io.TextIOWrapper(stream, encoding="utf-8", errors="replace"))
+            for record in reader:
+                if not record:
+                    continue
+                host = record[1].strip().lower() if len(record) > 1 else record[0].strip().lower()
+                host = host.removeprefix("www.").rstrip(".")
+                if not host or host in seen:
+                    continue
+                domain = registrable_domain(host)
+                if not domain:
+                    continue
+                seen.add(host)
+                rows.append({"url": normalize_url(host), "label": 0, "domain": domain})
+                if len(rows) >= limit:
+                    break
+    return rows
+
+
+def make_group_splits(frame: pd.DataFrame, seed: int) -> dict[str, pd.DataFrame]:
+    """Create approximately 70/15/15 splits with no domain crossing."""
+    groups = frame["domain"].astype(str).to_numpy()
+    first = GroupShuffleSplit(n_splits=1, test_size=0.30, random_state=seed)
+    train_idx, hold_idx = next(first.split(frame, frame["label"], groups))
+    train = frame.iloc[train_idx].copy()
+    hold = frame.iloc[hold_idx].copy()
+
+    second = GroupShuffleSplit(n_splits=1, test_size=0.50, random_state=seed + 1)
+    val_rel, test_rel = next(second.split(hold, hold["label"], hold["domain"]))
+    validation = hold.iloc[val_rel].copy()
+    test = hold.iloc[test_rel].copy()
+
+    splits = {"train": train, "validation": validation, "test": test}
+    domain_sets = {name: set(part["domain"]) for name, part in splits.items()}
+    overlaps = {
+        "train_validation": len(domain_sets["train"] & domain_sets["validation"]),
+        "train_test": len(domain_sets["train"] & domain_sets["test"]),
+        "validation_test": len(domain_sets["validation"] & domain_sets["test"]),
+    }
+    if any(overlaps.values()):
+        raise RuntimeError(f"Domain leakage detected: {overlaps}")
+    for name, part in splits.items():
+        if part["label"].nunique() < 2:
+            raise RuntimeError(f"{name} split contains only one class; obtain more source domains.")
+    return splits
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build PhishGuard URL dataset.")
+    parser.add_argument("--phishing-count", type=int, default=100000)
+    parser.add_argument("--benign-count", type=int, default=100000)
+    parser.add_argument("--artifacts", type=Path, default=Path("phishguard_artifacts"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--feed-url", default=PHISHING_FEED)
+    parser.add_argument("--tranco-url", default=TRANCO_ZIP)
     args = parser.parse_args()
 
-    csv_path = Path(args.csv).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.phishing_count < 2 or args.benign_count < 2:
+        parser.error("Both requested class counts must be at least 2.")
 
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    args.artifacts.mkdir(parents=True, exist_ok=True)
+    print("[1/4] Downloading active phishing feed...")
+    phishing = parse_phishing_feed(download_bytes(args.feed_url), args.phishing_count)
+    if len(phishing) < 2:
+        raise RuntimeError("The phishing feed returned fewer than two usable URLs.")
 
-    df = pd.read_csv(csv_path)
-    print(f"Loaded: {csv_path}")
-    print(f"Original shape: {df.shape}")
+    print(f"      Collected {len(phishing):,} unique phishing URLs.")
+    phishing_domains = {row["domain"] for row in phishing}
 
-    required = NUMERIC_FEATURES + CATEGORICAL_FEATURES + [
-        TARGET, URL_COLUMN, DOMAIN_COLUMN
-    ]
-    missing_columns = [c for c in required if c not in df.columns]
-    if missing_columns:
-        raise ValueError(f"CSV is missing required columns: {missing_columns}")
+    print("[2/4] Downloading Tranco top-sites list...")
+    benign_candidates = parse_tranco_zip(download_bytes(args.tranco_url), args.benign_count * 3)
+    benign = [row for row in benign_candidates if row["domain"] not in phishing_domains]
+    benign = benign[:args.benign_count]
+    if len(benign) < 2:
+        raise RuntimeError("Not enough conflict-free Tranco domains were available.")
 
-    # Remove duplicate URL records and invalid target rows.
-    df = df.drop_duplicates(subset=[URL_COLUMN]).copy()
-    df[TARGET] = pd.to_numeric(df[TARGET], errors="coerce")
-    df = df.dropna(subset=[TARGET]).copy()
-    df = df[df[TARGET].isin([0, 1])].copy()
-    df[TARGET] = df[TARGET].astype("int64")
+    # Use the same number of samples per class where possible.
+    count = min(len(phishing), len(benign))
+    phishing, benign = phishing[:count], benign[:count]
+    frame = pd.DataFrame(phishing + benign)
+    frame = frame.drop_duplicates(subset=["url"]).reset_index(drop=True)
+    frame["label"] = frame["label"].astype("int8")
+    frame = frame.sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
-    # Convert numeric columns; invalid values become NaN and are imputed later.
-    for col in NUMERIC_FEATURES:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df[NUMERIC_FEATURES] = df[NUMERIC_FEATURES].replace(
-        [np.inf, -np.inf], np.nan
-    )
-    df["tld"] = df["tld"].fillna(np.nan).astype("object")
+    print("[3/4] Creating domain-separated train/validation/test splits...")
+    splits = make_group_splits(frame, args.seed)
+    frame.to_csv(args.artifacts / "url_dataset.csv", index=False)
+    for name, part in splits.items():
+        part.to_csv(args.artifacts / f"{name}.csv", index=False)
 
-    # Missing domains get a URL-specific group so unrelated missing-domain
-    # records are not all forced into one giant group.
-    groups = df[DOMAIN_COLUMN].astype("object").copy()
-    missing_domain = groups.isna() | (groups.astype(str).str.strip() == "")
-    groups.loc[missing_domain] = (
-        "__missing_domain__" + df.loc[missing_domain, URL_COLUMN].astype(str)
-    )
-    groups = groups.astype(str)
-
-    X = df[NUMERIC_FEATURES + CATEGORICAL_FEATURES].copy()
-    y = df[TARGET].copy()
-
-    train_idx, val_idx, test_idx = grouped_split(
-        X, y, groups, seed=args.seed
+    allowlist = sorted({row["domain"] for row in benign})
+    (args.artifacts / "tranco_allowlist.txt").write_text(
+        "\n".join(allowlist) + "\n", encoding="utf-8"
     )
 
-    X_train, X_val, X_test = (
-        X.iloc[train_idx].copy(),
-        X.iloc[val_idx].copy(),
-        X.iloc[test_idx].copy(),
-    )
-    y_train, y_val, y_test = (
-        y.iloc[train_idx].copy(),
-        y.iloc[val_idx].copy(),
-        y.iloc[test_idx].copy(),
-    )
-    g_train, g_val, g_test = (
-        groups.iloc[train_idx],
-        groups.iloc[val_idx],
-        groups.iloc[test_idx],
-    )
-
-    # Fit only on training data to avoid preprocessing leakage.
-    preprocessor = build_preprocessor()
-    X_train_processed = preprocessor.fit_transform(X_train).astype(np.float32)
-    X_val_processed = preprocessor.transform(X_val).astype(np.float32)
-    X_test_processed = preprocessor.transform(X_test).astype(np.float32)
-
-    np.savez_compressed(
-        output_dir / "train.npz",
-        X=X_train_processed, y=y_train.to_numpy(dtype=np.int64)
-    )
-    np.savez_compressed(
-        output_dir / "validation.npz",
-        X=X_val_processed, y=y_val.to_numpy(dtype=np.int64)
-    )
-    np.savez_compressed(
-        output_dir / "test.npz",
-        X=X_test_processed, y=y_test.to_numpy(dtype=np.int64)
-    )
-    joblib.dump(preprocessor, output_dir / "preprocessor.joblib")
-
-    feature_names = preprocessor.get_feature_names_out().tolist()
-    domain_overlap = {
-        "train_validation": len(set(g_train) & set(g_val)),
-        "train_test": len(set(g_train) & set(g_test)),
-        "validation_test": len(set(g_val) & set(g_test)),
-    }
-
+    split_report = {}
+    for name, part in splits.items():
+        split_report[name] = {
+            "rows": int(len(part)),
+            "class_counts": {str(k): int(v) for k, v in part["label"].value_counts().items()},
+            "unique_domains": int(part["domain"].nunique()),
+        }
+    domain_sets = {name: set(part["domain"]) for name, part in splits.items()}
     report = {
-        "source_csv": str(csv_path),
-        "rows_after_cleaning": int(len(df)),
-        "source_columns": df.columns.tolist(),
-        "numeric_features": NUMERIC_FEATURES,
-        "categorical_features": CATEGORICAL_FEATURES,
-        "target": TARGET,
-        "processed_feature_count": int(X_train_processed.shape[1]),
-        "processed_feature_names": feature_names,
-        "split_shapes": {
-            "train": list(X_train_processed.shape),
-            "validation": list(X_val_processed.shape),
-            "test": list(X_test_processed.shape),
+        "source_phishing_feed": args.feed_url,
+        "source_benign_list": args.tranco_url,
+        "rows": int(len(frame)),
+        "class_counts": {str(k): int(v) for k, v in frame["label"].value_counts().items()},
+        "splits": split_report,
+        "domain_overlap": {
+            "train_validation": len(domain_sets["train"] & domain_sets["validation"]),
+            "train_test": len(domain_sets["train"] & domain_sets["test"]),
+            "validation_test": len(domain_sets["validation"] & domain_sets["test"]),
         },
-        "class_counts": {
-            "train": y_train.value_counts().sort_index().to_dict(),
-            "validation": y_val.value_counts().sort_index().to_dict(),
-            "test": y_test.value_counts().sort_index().to_dict(),
-        },
-        "domain_overlap": domain_overlap,
+        "normalisation": "scheme removed; one leading www. removed; host lowercased; path/query case preserved",
         "seed": args.seed,
     }
-    # JSON keys/values need to be plain Python types.
-    report["class_counts"] = {
-        split: {str(k): int(v) for k, v in counts.items()}
-        for split, counts in report["class_counts"].items()
-    }
-    with open(output_dir / "dataset_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-
-    print("\nProcessed split shapes:")
-    print("Train:     ", X_train_processed.shape)
-    print("Validation:", X_val_processed.shape)
-    print("Test:      ", X_test_processed.shape)
-    print("\nDomain overlap:", domain_overlap)
-    print("\nClass counts:")
-    for split, counts in report["class_counts"].items():
-        print(f"{split:10s}: {counts}")
-    print(f"\nArtifacts saved to: {output_dir}")
+    (args.artifacts / "dataset_report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+    print("[4/4] Dataset ready.")
+    print(f"      Rows: {len(frame):,} | classes: {report['class_counts']}")
+    print(f"      Splits: { {k: v['rows'] for k, v in split_report.items()} }")
+    print(f"      Domain overlap: {report['domain_overlap']}")
+    print(f"      Output: {args.artifacts.resolve()}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise
