@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import joblib
 
-from mlp_model import URLFeatureExtractor, normalize_url
+from model import URLFeatureExtractor, normalize_url
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -122,7 +122,7 @@ def classify(url: str, bundle: dict, allowlist: set[str]) -> dict:
     features["is_ip_address"] = bool(features["is_ip_address"])
     features["has_punycode"] = bool(features["has_punycode"])
     features["double_slash_in_path"] = bool(features["double_slash_in_path"])
-    evidence = collect_observations(normalized, host, features, listed)
+    evidence = collect_observations(url.strip(), host, features, listed)
 
     return {
         "input_url": url,
@@ -279,12 +279,12 @@ def main():
     model_path = args.model or (args.artifacts / "phishguard_model.joblib")
     if not model_path.is_file():
         raise FileNotFoundError(
-            f"Model not found: {model_path}. Train it first with mlp_model.py."
+            f"Model not found: {model_path}. Train it first with model.py."
         )
     bundle = joblib.load(model_path)
     if not isinstance(bundle, dict) or "model" not in bundle:
         raise RuntimeError(
-            "Incompatible model file. Retrain using the current mlp_model.py."
+            "Incompatible model file. Retrain using the current model.py."
         )
     allowlist_path = args.allowlist or (args.artifacts / "tranco_allowlist.txt")
     result = classify(url, bundle, load_allowlist(allowlist_path))

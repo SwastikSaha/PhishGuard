@@ -26,7 +26,7 @@ def main():
 
     if dataset is None and metrics is None:
         raise FileNotFoundError(
-            f"No reports found in {args.artifacts}. Run dataset_manager.py and mlp_model.py first."
+            f"No reports found in {args.artifacts}. Run dataset_manager.py and model.py first."
         )
 
     if dataset:

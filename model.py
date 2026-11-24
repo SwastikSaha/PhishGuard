@@ -138,11 +138,11 @@ class URLFeatureExtractor(BaseEstimator, TransformerMixin):
         return np.asarray(rows, dtype=np.float32)
 
 
-# Ensure joblib records a stable importable module path even when this file is
-# executed as a script (where Python would otherwise record __main__).
+# Keep the class importable as model.URLFeatureExtractor when this file is
+# executed directly for training. Joblib will then store the correct module path.
 if __name__ == "__main__":
-    sys.modules.setdefault("mlp_model", sys.modules[__name__])
-URLFeatureExtractor.__module__ = "mlp_model"
+    sys.modules.setdefault("model", sys.modules[__name__])
+URLFeatureExtractor.__module__ = "model"
 
 
 def build_model(max_features: int = 300000, min_df: int = 2, c_value: float = 2.0):
